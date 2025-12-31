@@ -71,6 +71,12 @@ webui = [
 deepspeed = [
   "deepspeed==0.17.1",
 ]
+# To install the API server support, use `uv sync --extra api`.
+api = [
+  "fastapi>=0.104.0",
+  "uvicorn>=0.24.0",
+  "python-multipart>=0.0.6",
+]
 
 [project.urls]
 Homepage = "https://github.com/index-tts/index-tts"
