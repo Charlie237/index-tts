@@ -96,6 +96,7 @@ def parse_args():
     parser.add_argument("--empty_cache_on_cache_miss", action="store_true", help="Call torch.cuda.empty_cache() on voice/emotion cache misses (v2 only)")
     parser.add_argument("--max_concurrent_inferences", type=int, default=1, help="Max in-flight inferences (default: 1)")
     parser.add_argument("--timing_headers", action="store_true", help="Add X-IndexTTS-* timing headers to responses")
+    parser.add_argument("--timing_log", action="store_true", help="Log per-request timings to server logs")
     parser.add_argument("--api_key", type=str, default=None)
     parser.add_argument("--reload", action="store_true")
     return parser.parse_args()
@@ -351,13 +352,27 @@ async def create_speech(request: SpeechRequest, _: str = Depends(verify_api_key)
         
         logger.info(f"Returning audio: {len(audio_data)} bytes, format={request.response_format}")
 
+        voice_resolve_ms = (t_voice_resolve - t0) * 1000
+        infer_ms = (t_infer_end - t_infer_start) * 1000
+        convert_ms = (t_convert_end - t_convert_start) * 1000
+        total_ms = (t_convert_end - t0) * 1000
+
+        if app.state.args.timing_log:
+            logger.info(
+                "Timings(ms): voice_resolve=%.2f infer=%.2f convert=%.2f total=%.2f",
+                voice_resolve_ms,
+                infer_ms,
+                convert_ms,
+                total_ms,
+            )
+
         headers = {"Content-Disposition": f'attachment; filename="speech.{request.response_format}"'}
         if app.state.args.timing_headers:
             headers.update({
-                "X-IndexTTS-Time-VoiceResolve-MS": f"{(t_voice_resolve - t0) * 1000:.2f}",
-                "X-IndexTTS-Time-Infer-MS": f"{(t_infer_end - t_infer_start) * 1000:.2f}",
-                "X-IndexTTS-Time-Convert-MS": f"{(t_convert_end - t_convert_start) * 1000:.2f}",
-                "X-IndexTTS-Time-Total-MS": f"{(t_convert_end - t0) * 1000:.2f}",
+                "X-IndexTTS-Time-VoiceResolve-MS": f"{voice_resolve_ms:.2f}",
+                "X-IndexTTS-Time-Infer-MS": f"{infer_ms:.2f}",
+                "X-IndexTTS-Time-Convert-MS": f"{convert_ms:.2f}",
+                "X-IndexTTS-Time-Total-MS": f"{total_ms:.2f}",
             })
         
         return Response(
