@@ -689,43 +689,104 @@ class IndexTTS2:
                     )
                     gpt_forward_time += time.perf_counter() - m_start_time
 
+                latent_gpt = latent
+                m_start_time = time.perf_counter()
                 with torch.amp.autocast(
                     text_tokens.device.type,
                     enabled=self.s2mel_amp_dtype is not None,
                     dtype=self.s2mel_amp_dtype,
                 ):
-                    m_start_time = time.perf_counter()
                     diffusion_steps = 25
                     inference_cfg_rate = 0.7
-                    latent = self.s2mel.models['gpt_layer'](latent)
+                    latent_s2mel = self.s2mel.models['gpt_layer'](latent_gpt)
                     S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
                     S_infer = S_infer.transpose(1, 2)
-                    S_infer = S_infer + latent
+                    S_infer = S_infer + latent_s2mel
                     target_lengths = (code_lens * 1.72).long()
 
-                    cond = self.s2mel.models['length_regulator'](S_infer,
-                                                                 ylens=target_lengths,
-                                                                 n_quantizers=3,
-                                                                 f0=None)[0]
+                    cond = self.s2mel.models['length_regulator'](
+                        S_infer,
+                        ylens=target_lengths,
+                        n_quantizers=3,
+                        f0=None
+                    )[0]
                     cat_condition = torch.cat([prompt_condition, cond], dim=1)
-                    vc_target = self.s2mel.models['cfm'].inference(cat_condition,
-                                                                   torch.LongTensor([cat_condition.size(1)]).to(
-                                                                       cond.device),
-                                                                   ref_mel, style, None, diffusion_steps,
-                                                                   inference_cfg_rate=inference_cfg_rate)
-                    vc_target = vc_target[:, :, ref_mel.size(-1):]
-                    s2mel_time += time.perf_counter() - m_start_time
+                    vc_target = self.s2mel.models['cfm'].inference(
+                        cat_condition,
+                        torch.LongTensor([cat_condition.size(1)]).to(cond.device),
+                        ref_mel,
+                        style,
+                        None,
+                        diffusion_steps,
+                        inference_cfg_rate=inference_cfg_rate,
+                    )
+                vc_target = vc_target[:, :, ref_mel.size(-1):]
+                s2mel_time += time.perf_counter() - m_start_time
 
-                    m_start_time = time.perf_counter()
-                    with torch.amp.autocast(
-                        text_tokens.device.type,
-                        enabled=self.vocoder_amp_dtype is not None,
-                        dtype=self.vocoder_amp_dtype,
-                    ):
-                        vc_target_in = vc_target if self.vocoder_amp_dtype is not None else vc_target.float()
-                        wav = self.bigvgan(vc_target_in).squeeze().unsqueeze(0)
-                    bigvgan_time += time.perf_counter() - m_start_time
+                m_start_time = time.perf_counter()
+                with torch.amp.autocast(
+                    text_tokens.device.type,
+                    enabled=self.vocoder_amp_dtype is not None,
+                    dtype=self.vocoder_amp_dtype,
+                ):
+                    vc_target_in = vc_target if self.vocoder_amp_dtype is not None else vc_target.float()
+                    wav = self.bigvgan(vc_target_in).squeeze().unsqueeze(0)
+                bigvgan_time += time.perf_counter() - m_start_time
+                wav = wav.squeeze(1)
+
+                try:
+                    wav_abs_max = float(wav.detach().abs().max().item())
+                    wav_all_finite = bool(torch.isfinite(wav).all().item())
+                except Exception:
+                    wav_abs_max = 0.0
+                    wav_all_finite = False
+
+                if (not wav_all_finite) or wav_abs_max < 1e-4:
+                    if verbose or log_timings:
+                        print(
+                            f">> WARN: silent/invalid vocoder output detected (absmax={wav_abs_max:.2e}, finite={wav_all_finite}); "
+                            "retrying in float32...",
+                        )
+                    # Retry vocoder in float32 first (cheap).
+                    wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0)
                     wav = wav.squeeze(1)
+                    try:
+                        wav_abs_max = float(wav.detach().abs().max().item())
+                        wav_all_finite = bool(torch.isfinite(wav).all().item())
+                    except Exception:
+                        wav_abs_max = 0.0
+                        wav_all_finite = False
+
+                if (not wav_all_finite) or wav_abs_max < 1e-4:
+                    # Retry s2mel+vocoder in float32 (expensive, but avoids "no sound").
+                    if self.s2mel_amp_dtype is not None:
+                        if verbose or log_timings:
+                            print(">> WARN: retrying s2mel+vocoder in float32...")
+                        diffusion_steps = 25
+                        inference_cfg_rate = 0.7
+                        latent_s2mel = self.s2mel.models['gpt_layer'](latent_gpt.float())
+                        S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
+                        S_infer = S_infer.transpose(1, 2)
+                        S_infer = S_infer + latent_s2mel
+                        target_lengths = (code_lens * 1.72).long()
+                        cond = self.s2mel.models['length_regulator'](
+                            S_infer,
+                            ylens=target_lengths,
+                            n_quantizers=3,
+                            f0=None
+                        )[0]
+                        cat_condition = torch.cat([prompt_condition, cond], dim=1)
+                        vc_target = self.s2mel.models['cfm'].inference(
+                            cat_condition,
+                            torch.LongTensor([cat_condition.size(1)]).to(cond.device),
+                            ref_mel,
+                            style,
+                            None,
+                            diffusion_steps,
+                            inference_cfg_rate=inference_cfg_rate,
+                        )
+                        vc_target = vc_target[:, :, ref_mel.size(-1):]
+                        wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0).squeeze(1)
 
                 wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
                 if verbose:
