@@ -88,6 +88,7 @@ def parse_args():
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--voices_dir", type=str, default="voices")
     parser.add_argument("--model_version", type=str, default="v2", choices=["v1", "v2"])
+    parser.add_argument("--cuda_kernel", action="store_true", help="Enable BigVGAN custom CUDA kernel (requires nvcc+ninja)")
     parser.add_argument("--torch_compile", action="store_true", help="Enable torch.compile (v2: s2mel, v1: n/a)")
     parser.add_argument("--accel", action="store_true", help="Enable GPT acceleration engine (v2 only)")
     parser.add_argument("--deepspeed", action="store_true", help="Enable DeepSpeed (v2 only, requires extra)")
@@ -119,6 +120,7 @@ def load_model(args):
             model_dir=args.model_dir,
             use_fp16=args.fp16,
             device=args.device,
+            use_cuda_kernel=args.cuda_kernel,
             use_deepspeed=args.deepspeed,
             use_accel=args.accel,
             use_torch_compile=args.torch_compile,
@@ -132,7 +134,8 @@ def load_model(args):
             cfg_path=config_path,
             model_dir=args.model_dir,
             use_fp16=args.fp16,
-            device=args.device
+            device=args.device,
+            use_cuda_kernel=args.cuda_kernel,
         )
     
     logger.info("Model loaded successfully!")

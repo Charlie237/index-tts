@@ -147,6 +147,21 @@ uv run api_server.py \
   --timing_log
 ```
 
+### Optional: DeepSpeed (`--deepspeed`)
+
+DeepSpeed is not enabled by default. If you want to try it:
+
+```bash
+uv sync --extra deepspeed
+```
+
+Then add `--deepspeed` to `api_server.py`. Performance impact varies by system; benchmark both ways.
+
+### Optional: BigVGAN custom CUDA kernel (`--cuda_kernel`)
+
+This requires a CUDA Toolkit toolchain (`nvcc`) and `ninja` that match your PyTorch CUDA build.
+On managed compute platforms that only provide CUDA runtime (no Toolkit), keep this disabled.
+
 ### Notes
 
 - Lowest latency: use `response_format="wav"` (other formats invoke `ffmpeg` conversion per request).
@@ -266,4 +281,3 @@ Use `uv run` so your script runs in the correct environment:
 ```bash
 PYTHONPATH="$PYTHONPATH:." uv run indextts/infer_v2.py
 ```
-
