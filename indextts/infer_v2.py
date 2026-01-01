@@ -38,7 +38,10 @@ import torch.nn.functional as F
 class IndexTTS2:
     def __init__(
             self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=False, device=None,
-            use_cuda_kernel=None,use_deepspeed=False, use_accel=False, use_torch_compile=False
+            use_cuda_kernel=None, use_deepspeed=False, use_accel=False, use_torch_compile=False,
+            empty_cache_on_cache_miss: bool = False,
+            use_s2mel_amp: bool = False,
+            use_vocoder_amp: bool = False,
     ):
         """
         Args:
@@ -79,6 +82,35 @@ class IndexTTS2:
         self.stop_mel_token = self.cfg.gpt.stop_mel_token
         self.use_accel = use_accel
         self.use_torch_compile = use_torch_compile
+        self.empty_cache_on_cache_miss = empty_cache_on_cache_miss
+        self.use_s2mel_amp = use_s2mel_amp
+        self.use_vocoder_amp = use_vocoder_amp
+        self.s2mel_amp_dtype = None
+        self.vocoder_amp_dtype = None
+        if "cuda" in str(self.device):
+            try:
+                torch.set_float32_matmul_precision("high")
+            except Exception:
+                pass
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = True
+            except Exception:
+                pass
+            try:
+                torch.backends.cudnn.allow_tf32 = True
+                torch.backends.cudnn.benchmark = True
+            except Exception:
+                pass
+            if self.use_s2mel_amp or self.use_vocoder_amp:
+                try:
+                    bf16_ok = torch.cuda.is_bf16_supported()
+                except Exception:
+                    bf16_ok = False
+                amp_dtype = torch.bfloat16 if bf16_ok else torch.float16
+                if self.use_s2mel_amp:
+                    self.s2mel_amp_dtype = amp_dtype
+                if self.use_vocoder_amp:
+                    self.vocoder_amp_dtype = amp_dtype
 
         self.qwen_emo = QwenEmotion(os.path.join(self.model_dir, self.cfg.qwen_emo_path))
 
@@ -323,19 +355,40 @@ class IndexTTS2:
         if self.gr_progress is not None:
             self.gr_progress(value, desc=desc)
 
-    def _load_and_cut_audio(self,audio_path,max_audio_length_seconds,verbose=False,sr=None):
-        if not sr:
-            audio, sr = librosa.load(audio_path)
-        else:
-            audio, _ = librosa.load(audio_path,sr=sr)
-        audio = torch.tensor(audio).unsqueeze(0)
-        max_audio_samples = int(max_audio_length_seconds * sr)
+    def _empty_cache(self):
+        if not self.empty_cache_on_cache_miss:
+            return
+        try:
+            if "cuda" in str(self.device):
+                torch.cuda.empty_cache()
+            elif "mps" in str(self.device):
+                torch.mps.empty_cache()
+        except Exception:
+            return
 
+    def _load_and_cut_audio(self, audio_path, max_audio_length_seconds, verbose=False, sr=None):
+        try:
+            audio, native_sr = torchaudio.load(audio_path)
+            audio = audio.mean(dim=0, keepdim=True)
+            if sr and native_sr != sr:
+                audio = torchaudio.transforms.Resample(native_sr, sr)(audio)
+                used_sr = sr
+            else:
+                used_sr = native_sr
+        except Exception:
+            if not sr:
+                audio_np, used_sr = librosa.load(audio_path)
+            else:
+                audio_np, _ = librosa.load(audio_path, sr=sr)
+                used_sr = sr
+            audio = torch.tensor(audio_np).unsqueeze(0)
+
+        max_audio_samples = int(max_audio_length_seconds * used_sr)
         if audio.shape[1] > max_audio_samples:
             if verbose:
                 print(f"Audio too long ({audio.shape[1]} samples), truncating to {max_audio_samples} samples")
             audio = audio[:, :max_audio_samples]
-        return audio, sr
+        return audio, used_sr
     
     def normalize_emo_vec(self, emo_vector, apply_bias=True):
         # apply biased emotion factors for better user experience,
@@ -358,14 +411,15 @@ class IndexTTS2:
               emo_audio_prompt=None, emo_alpha=1.0,
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-              verbose=False, max_text_tokens_per_segment=120, stream_return=False, more_segment_before=0, **generation_kwargs):
+              verbose=False, log_timings: bool = True, return_tensor: bool = False,
+              max_text_tokens_per_segment=120, stream_return=False, more_segment_before=0, **generation_kwargs):
         if stream_return:
             return self.infer_generator(
                 spk_audio_prompt, text, output_path,
                 emo_audio_prompt, emo_alpha,
                 emo_vector,
                 use_emo_text, emo_text, use_random, interval_silence,
-                verbose, max_text_tokens_per_segment, stream_return, more_segment_before, **generation_kwargs
+                verbose, log_timings, return_tensor, max_text_tokens_per_segment, stream_return, more_segment_before, **generation_kwargs
             )
         else:
             try:
@@ -374,7 +428,7 @@ class IndexTTS2:
                     emo_audio_prompt, emo_alpha,
                     emo_vector,
                     use_emo_text, emo_text, use_random, interval_silence,
-                    verbose, max_text_tokens_per_segment, stream_return, more_segment_before, **generation_kwargs
+                    verbose, log_timings, return_tensor, max_text_tokens_per_segment, stream_return, more_segment_before, **generation_kwargs
                 ))[0]
             except IndexError:
                 return None
@@ -383,8 +437,10 @@ class IndexTTS2:
               emo_audio_prompt=None, emo_alpha=1.0,
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-              verbose=False, max_text_tokens_per_segment=120, stream_return=False, quick_streaming_tokens=0, **generation_kwargs):
-        print(">> starting inference...")
+              verbose=False, log_timings: bool = True, return_tensor: bool = False,
+              max_text_tokens_per_segment=120, stream_return=False, quick_streaming_tokens=0, **generation_kwargs):
+        if verbose or log_timings:
+            print(">> starting inference...")
         self._set_gr_progress(0, "starting inference...")
         if verbose:
             print(f"origin text:{text}, spk_audio_prompt:{spk_audio_prompt}, "
@@ -403,7 +459,8 @@ class IndexTTS2:
             if emo_text is None:
                 emo_text = text  # use main text prompt
             emo_dict = self.qwen_emo.inference(emo_text)
-            print(f"detected emotion vectors from text: {emo_dict}")
+            if verbose or log_timings:
+                print(f"detected emotion vectors from text: {emo_dict}")
             # convert ordered dict to list of vectors; the order is VERY important!
             emo_vector = list(emo_dict.values())
 
@@ -415,7 +472,8 @@ class IndexTTS2:
             if emo_vector_scale != 1.0:
                 # scale each vector and truncate to 4 decimals (for nicer printing)
                 emo_vector = [int(x * emo_vector_scale * 10000) / 10000 for x in emo_vector]
-                print(f"scaled emotion vectors to {emo_vector_scale}x: {emo_vector}")
+                if verbose or log_timings:
+                    print(f"scaled emotion vectors to {emo_vector_scale}x: {emo_vector}")
 
         if emo_audio_prompt is None:
             # we are not using any external "emotion reference voice"; use
@@ -431,7 +489,7 @@ class IndexTTS2:
                 self.cache_s2mel_style = None
                 self.cache_s2mel_prompt = None
                 self.cache_mel = None
-                torch.cuda.empty_cache()
+                self._empty_cache()
             audio,sr = self._load_and_cut_audio(spk_audio_prompt,15,verbose)
             audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
             audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
@@ -485,7 +543,7 @@ class IndexTTS2:
         if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
             if self.cache_emo_cond is not None:
                 self.cache_emo_cond = None
-                torch.cuda.empty_cache()
+                self._empty_cache()
             emo_audio, _ = self._load_and_cut_audio(emo_audio_prompt,15,verbose,sr=16000)
             emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
             emo_input_features = emo_inputs["input_features"]
@@ -631,8 +689,11 @@ class IndexTTS2:
                     )
                     gpt_forward_time += time.perf_counter() - m_start_time
 
-                dtype = None
-                with torch.amp.autocast(text_tokens.device.type, enabled=dtype is not None, dtype=dtype):
+                with torch.amp.autocast(
+                    text_tokens.device.type,
+                    enabled=self.s2mel_amp_dtype is not None,
+                    dtype=self.s2mel_amp_dtype,
+                ):
                     m_start_time = time.perf_counter()
                     diffusion_steps = 25
                     inference_cfg_rate = 0.7
@@ -656,8 +717,13 @@ class IndexTTS2:
                     s2mel_time += time.perf_counter() - m_start_time
 
                     m_start_time = time.perf_counter()
-                    wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0)
-                    print(wav.shape)
+                    with torch.amp.autocast(
+                        text_tokens.device.type,
+                        enabled=self.vocoder_amp_dtype is not None,
+                        dtype=self.vocoder_amp_dtype,
+                    ):
+                        vc_target_in = vc_target if self.vocoder_amp_dtype is not None else vc_target.float()
+                        wav = self.bigvgan(vc_target_in).squeeze().unsqueeze(0)
                     bigvgan_time += time.perf_counter() - m_start_time
                     wav = wav.squeeze(1)
 
@@ -677,13 +743,14 @@ class IndexTTS2:
         wavs = self.insert_interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)
         wav = torch.cat(wavs, dim=1)
         wav_length = wav.shape[-1] / sampling_rate
-        print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
-        print(f">> gpt_forward_time: {gpt_forward_time:.2f} seconds")
-        print(f">> s2mel_time: {s2mel_time:.2f} seconds")
-        print(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
-        print(f">> Total inference time: {end_time - start_time:.2f} seconds")
-        print(f">> Generated audio length: {wav_length:.2f} seconds")
-        print(f">> RTF: {(end_time - start_time) / wav_length:.4f}")
+        if verbose or log_timings:
+            print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
+            print(f">> gpt_forward_time: {gpt_forward_time:.2f} seconds")
+            print(f">> s2mel_time: {s2mel_time:.2f} seconds")
+            print(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
+            print(f">> Total inference time: {end_time - start_time:.2f} seconds")
+            print(f">> Generated audio length: {wav_length:.2f} seconds")
+            print(f">> RTF: {(end_time - start_time) / wav_length:.4f}")
 
         # save audio
         wav = wav.cpu()  # to cpu
@@ -702,6 +769,9 @@ class IndexTTS2:
         else:
             if stream_return:
                 return None
+            if return_tensor:
+                yield (sampling_rate, wav.type(torch.int16))
+                return
             # 返回以符合Gradio的格式要求
             wav_data = wav.type(torch.int16)
             wav_data = wav_data.numpy().T

@@ -5,7 +5,7 @@ import os
 import base64
 import hashlib
 import json
-import tempfile
+import time
 from datetime import datetime
 from typing import Optional, Dict, List
 from pathlib import Path
@@ -18,12 +18,15 @@ class VoiceManager:
         self.voices_dir = Path(voices_dir)
         self.examples_dir = Path(examples_dir)
         self.voices_dir.mkdir(parents=True, exist_ok=True)
+        self._tmp_voices_dir = self.voices_dir / "_tmp"
+        self._tmp_voices_dir.mkdir(parents=True, exist_ok=True)
         
         self._registry: Dict[str, dict] = {}
         self._registry_file = self.voices_dir / "registry.json"
         
         self._load_registry()
         self._register_examples()
+        self._cleanup_tmp_voices()
     
     def _load_registry(self):
         """Load voice registry from file."""
@@ -43,23 +46,44 @@ class VoiceManager:
         """Register example voices from examples directory."""
         if not self.examples_dir.exists():
             return
-        
-        # Support both wav and mp3 files
-        for ext in ["*.wav", "*.mp3"]:
-            for audio_file in self.examples_dir.glob(ext):
-                voice_id = audio_file.stem
-                if voice_id not in self._registry:
-                    self._registry[voice_id] = {
-                        "id": voice_id,
-                        "name": voice_id.replace("_", " ").title(),
-                        "path": str(audio_file.absolute()),  # Use absolute path!
-                        "description": f"Example voice: {voice_id}",
-                        "preview_url": f"/voices/{voice_id}/preview",
-                        "created_at": datetime.now().isoformat(),
-                        "is_example": True
-                    }
-        
-        self._save_registry()
+
+        # Prefer WAV over MP3 for the same stem (faster decode, fewer dependencies).
+        by_stem: Dict[str, Path] = {}
+        for audio_file in self.examples_dir.glob("*.mp3"):
+            by_stem[audio_file.stem] = audio_file
+        for audio_file in self.examples_dir.glob("*.wav"):
+            by_stem[audio_file.stem] = audio_file
+
+        changed = False
+        for voice_id, audio_file in by_stem.items():
+            new_path = str(audio_file.absolute())
+            existing = self._registry.get(voice_id)
+
+            if not existing:
+                self._registry[voice_id] = {
+                    "id": voice_id,
+                    "name": voice_id.replace("_", " ").title(),
+                    "path": new_path,
+                    "description": f"Example voice: {voice_id}",
+                    "preview_url": f"/voices/{voice_id}/preview",
+                    "created_at": datetime.now().isoformat(),
+                    "is_example": True,
+                }
+                changed = True
+                continue
+
+            # Upgrade existing example entries to prefer WAV if available.
+            if existing.get("is_example") is True:
+                old_path = existing.get("path")
+                old_ext = (Path(old_path).suffix.lower() if old_path else "")
+                new_ext = audio_file.suffix.lower()
+                should_upgrade = (old_ext == ".mp3" and new_ext == ".wav") or (not old_path) or (not os.path.isfile(old_path))
+                if should_upgrade and old_path != new_path:
+                    existing["path"] = new_path
+                    changed = True
+
+        if changed:
+            self._save_registry()
     
     def get_voice_path(self, voice_id: str) -> Optional[str]:
         """Get the audio file path for a voice ID."""
@@ -86,21 +110,47 @@ class VoiceManager:
         return None
     
     def save_voice_from_base64(self, audio_base64: str) -> str:
-        """Save a base64-encoded audio to a temporary file."""
+        """Save a base64-encoded audio to a stable cached file.
+
+        Returning a stable path allows the TTS model's internal caches to work
+        across repeated requests that use the same reference audio.
+        """
         try:
             audio_data = base64.b64decode(audio_base64)
         except Exception as e:
             raise ValueError(f"Invalid base64 audio data: {e}")
-        
-        fd, temp_path = tempfile.mkstemp(suffix=".wav")
+
+        voice_hash = hashlib.md5(audio_data).hexdigest()[:12]
+        cached_path = self._tmp_voices_dir / f"b64_{voice_hash}.wav"
+        if not cached_path.exists():
+            cached_path.write_bytes(audio_data)
+            # Best-effort cleanup to avoid unbounded growth.
+            self._cleanup_tmp_voices()
+        return str(cached_path.absolute())
+
+    def _cleanup_tmp_voices(self, max_age_seconds: int = 7 * 24 * 60 * 60, max_files: int = 512) -> None:
+        """Remove cached temp voices older than max_age_seconds and enforce max_files."""
+        now = time.time()
         try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(audio_data)
-        except Exception:
-            os.close(fd)
-            raise
-        
-        return temp_path
+            files = list(self._tmp_voices_dir.glob("b64_*.wav"))
+            for p in files:
+                try:
+                    if now - p.stat().st_mtime > max_age_seconds:
+                        p.unlink(missing_ok=True)
+                except OSError:
+                    continue
+            if max_files > 0:
+                files = [p for p in files if p.exists()]
+                if len(files) > max_files:
+                    files.sort(key=lambda p: p.stat().st_mtime)
+                    for p in files[: max(0, len(files) - max_files)]:
+                        try:
+                            p.unlink(missing_ok=True)
+                        except OSError:
+                            continue
+        except OSError:
+            # best-effort cleanup
+            return
     
     def register_voice(self, name: str, audio_base64: str, description: Optional[str] = None) -> dict:
         """Register a new voice from base64 audio."""

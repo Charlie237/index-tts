@@ -285,6 +285,24 @@ Have fun!
 > per-project virtual environments. Do *not* manually activate any environments
 > before running `uv` commands, since that could lead to dependency conflicts!
 
+#### 🧩 OpenAI-Compatible API Server
+
+Install the API extra:
+
+```bash
+uv sync --extra api
+```
+
+Start the server:
+
+```bash
+uv run api_server.py --host 0.0.0.0 --port 8000 --model_version v2 --fp16 --torch_compile --accel
+```
+
+Notes:
+- For lowest latency, prefer `response_format="wav"` (formats like `mp3/opus/flac` require `ffmpeg` conversion per request).
+- To profile where time is spent, add `--timing_headers` and inspect the `X-IndexTTS-Time-*` response headers.
+
 
 #### 📝 Using IndexTTS2 in Python
 

@@ -63,6 +63,20 @@ class IndexTTS:
         self.model_dir = model_dir
         self.dtype = torch.float16 if self.use_fp16 else None
         self.stop_mel_token = self.cfg.gpt.stop_mel_token
+        if "cuda" in str(self.device):
+            try:
+                torch.set_float32_matmul_precision("high")
+            except Exception:
+                pass
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = True
+            except Exception:
+                pass
+            try:
+                torch.backends.cudnn.allow_tf32 = True
+                torch.backends.cudnn.benchmark = True
+            except Exception:
+                pass
 
         # Comment-off to load the VQ-VAE model for debugging tokenizer
         #   https://github.com/index-tts/index-tts/issues/34
@@ -281,7 +295,8 @@ class IndexTTS:
 
     # 快速推理：对于“多句长文本”，可实现至少 2~10 倍以上的速度提升~ （First modified by sunnyboxs 2025-04-16）
     def infer_fast(self, audio_prompt, text, output_path, verbose=False, max_text_tokens_per_segment=100,
-                   segments_bucket_max_size=4, **generation_kwargs):
+                   segments_bucket_max_size=4, log_timings: bool = True, return_tensor: bool = False,
+                   empty_cache: bool = False, **generation_kwargs):
         """
         Args:
             ``max_text_tokens_per_segment``: 分句的最大token数，默认``100``，可以根据GPU硬件情况调整
@@ -291,7 +306,8 @@ class IndexTTS:
                 - 越大，bucket数量越少，batch越多，推理速度越*快*，占用内存更多，可能影响质量
                 - 越小，bucket数量越多，batch越少，推理速度越*慢*，占用内存和质量更接近于非快速推理
         """
-        print(">> starting fast inference...")
+        if verbose or log_timings:
+            print(">> starting fast inference...")
 
         self._set_gr_progress(0, "starting fast inference...")
         if verbose:
@@ -466,7 +482,7 @@ class IndexTTS:
 
         # bigvgan chunk decode
         self._set_gr_progress(0.7, "bigvgan decoding...")
-        tqdm_progress = tqdm(total=latent_length, desc="bigvgan")
+        tqdm_progress = tqdm(total=latent_length, desc="bigvgan", disable=not verbose)
         for items in chunk_latents:
             tqdm_progress.update(len(items))
             latent = torch.cat(items, dim=1)
@@ -484,22 +500,24 @@ class IndexTTS:
         tqdm_progress.close()  # 确保进度条被关闭
         del all_latents, chunk_latents
         end_time = time.perf_counter()
-        self.torch_empty_cache()
+        if empty_cache:
+            self.torch_empty_cache()
 
         # wav audio output
         self._set_gr_progress(0.9, "saving audio...")
         wav = torch.cat(wavs, dim=1)
         wav_length = wav.shape[-1] / sampling_rate
-        print(f">> Reference audio length: {cond_mel_frame * 256 / sampling_rate:.2f} seconds")
-        print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
-        print(f">> gpt_forward_time: {gpt_forward_time:.2f} seconds")
-        print(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
-        print(f">> Total fast inference time: {end_time - start_time:.2f} seconds")
-        print(f">> Generated audio length: {wav_length:.2f} seconds")
-        print(f">> [fast] bigvgan chunk_length: {chunk_length}")
-        print(f">> [fast] batch_num: {all_batch_num} bucket_max_size: {bucket_max_size}",
-              f"bucket_count: {bucket_count}" if bucket_max_size > 1 else "")
-        print(f">> [fast] RTF: {(end_time - start_time) / wav_length:.4f}")
+        if verbose or log_timings:
+            print(f">> Reference audio length: {cond_mel_frame * 256 / sampling_rate:.2f} seconds")
+            print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
+            print(f">> gpt_forward_time: {gpt_forward_time:.2f} seconds")
+            print(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
+            print(f">> Total fast inference time: {end_time - start_time:.2f} seconds")
+            print(f">> Generated audio length: {wav_length:.2f} seconds")
+            print(f">> [fast] bigvgan chunk_length: {chunk_length}")
+            print(f">> [fast] batch_num: {all_batch_num} bucket_max_size: {bucket_max_size}",
+                  f"bucket_count: {bucket_count}" if bucket_max_size > 1 else "")
+            print(f">> [fast] RTF: {(end_time - start_time) / wav_length:.4f}")
 
         # save audio
         wav = wav.cpu()  # to cpu
@@ -507,9 +525,12 @@ class IndexTTS:
             # 直接保存音频到指定路径中
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
             torchaudio.save(output_path, wav.type(torch.int16), sampling_rate)
-            print(">> wav file saved to:", output_path)
+            if verbose or log_timings:
+                print(">> wav file saved to:", output_path)
             return output_path
         else:
+            if return_tensor:
+                return (sampling_rate, wav.type(torch.int16))
             # 返回以符合Gradio的格式要求
             wav_data = wav.type(torch.int16)
             wav_data = wav_data.numpy().T
@@ -517,8 +538,9 @@ class IndexTTS:
 
     # 原始推理模式
     def infer(self, audio_prompt, text, output_path, verbose=False, max_text_tokens_per_segment=120,
-              **generation_kwargs):
-        print(">> starting inference...")
+              log_timings: bool = True, return_tensor: bool = False, **generation_kwargs):
+        if verbose or log_timings:
+            print(">> starting inference...")
         self._set_gr_progress(0, "starting inference...")
         if verbose:
             print(f"origin text:{text}")
@@ -656,13 +678,14 @@ class IndexTTS:
         self._set_gr_progress(0.9, "saving audio...")
         wav = torch.cat(wavs, dim=1)
         wav_length = wav.shape[-1] / sampling_rate
-        print(f">> Reference audio length: {cond_mel_frame * 256 / sampling_rate:.2f} seconds")
-        print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
-        print(f">> gpt_forward_time: {gpt_forward_time:.2f} seconds")
-        print(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
-        print(f">> Total inference time: {end_time - start_time:.2f} seconds")
-        print(f">> Generated audio length: {wav_length:.2f} seconds")
-        print(f">> RTF: {(end_time - start_time) / wav_length:.4f}")
+        if verbose or log_timings:
+            print(f">> Reference audio length: {cond_mel_frame * 256 / sampling_rate:.2f} seconds")
+            print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
+            print(f">> gpt_forward_time: {gpt_forward_time:.2f} seconds")
+            print(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
+            print(f">> Total inference time: {end_time - start_time:.2f} seconds")
+            print(f">> Generated audio length: {wav_length:.2f} seconds")
+            print(f">> RTF: {(end_time - start_time) / wav_length:.4f}")
 
         # save audio
         wav = wav.cpu()  # to cpu
@@ -674,9 +697,12 @@ class IndexTTS:
             if os.path.dirname(output_path) != "":
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
             torchaudio.save(output_path, wav.type(torch.int16), sampling_rate)
-            print(">> wav file saved to:", output_path)
+            if verbose or log_timings:
+                print(">> wav file saved to:", output_path)
             return output_path
         else:
+            if return_tensor:
+                return (sampling_rate, wav.type(torch.int16))
             # 返回以符合Gradio的格式要求
             wav_data = wav.type(torch.int16)
             wav_data = wav_data.numpy().T

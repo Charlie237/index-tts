@@ -4,15 +4,15 @@ IndexTTS2 OpenAI-compatible REST API Server
 
 Usage:
     python api_server.py --port 8000 --model_dir checkpoints
-    python api_server.py --port 8000 --model_dir checkpoints --fp16 --api_key sk-xxx
+    python api_server.py --port 8000 --model_dir checkpoints --fp16 --torch_compile --accel --api_key sk-xxx
 """
 import os
 import sys
 import argparse
-import tempfile
 import time
 import logging
 import traceback
+import asyncio
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -22,6 +22,7 @@ from fastapi import FastAPI, HTTPException, Response, Request, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from starlette.concurrency import run_in_threadpool
 
 # Import from api folder (project root level)
 from api.schemas import (
@@ -87,6 +88,14 @@ def parse_args():
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--voices_dir", type=str, default="voices")
     parser.add_argument("--model_version", type=str, default="v2", choices=["v1", "v2"])
+    parser.add_argument("--torch_compile", action="store_true", help="Enable torch.compile (v2: s2mel, v1: n/a)")
+    parser.add_argument("--accel", action="store_true", help="Enable GPT acceleration engine (v2 only)")
+    parser.add_argument("--deepspeed", action="store_true", help="Enable DeepSpeed (v2 only, requires extra)")
+    parser.add_argument("--s2mel_amp", action="store_true", help="Enable AMP for s2mel (v2 only)")
+    parser.add_argument("--vocoder_amp", action="store_true", help="Enable AMP for vocoder (v2 only)")
+    parser.add_argument("--empty_cache_on_cache_miss", action="store_true", help="Call torch.cuda.empty_cache() on voice/emotion cache misses (v2 only)")
+    parser.add_argument("--max_concurrent_inferences", type=int, default=1, help="Max in-flight inferences (default: 1)")
+    parser.add_argument("--timing_headers", action="store_true", help="Add X-IndexTTS-* timing headers to responses")
     parser.add_argument("--api_key", type=str, default=None)
     parser.add_argument("--reload", action="store_true")
     return parser.parse_args()
@@ -108,7 +117,13 @@ def load_model(args):
             cfg_path=config_path,
             model_dir=args.model_dir,
             use_fp16=args.fp16,
-            device=args.device
+            device=args.device,
+            use_deepspeed=args.deepspeed,
+            use_accel=args.accel,
+            use_torch_compile=args.torch_compile,
+            empty_cache_on_cache_miss=args.empty_cache_on_cache_miss,
+            use_s2mel_amp=args.s2mel_amp,
+            use_vocoder_amp=args.vocoder_amp,
         )
     else:
         from indextts.infer import IndexTTS
@@ -142,6 +157,7 @@ async def lifespan(app: FastAPI):
     
     # Load model
     tts_model = load_model(args)
+    app.state.infer_semaphore = asyncio.Semaphore(max(1, int(args.max_concurrent_inferences)))
     
     yield
     
@@ -231,6 +247,8 @@ async def create_speech(request: SpeechRequest, _: str = Depends(verify_api_key)
     if tts_model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     
+    t0 = time.perf_counter()
+
     # Resolve voice path
     voice_path = None
     emo_audio_path = None
@@ -249,6 +267,7 @@ async def create_speech(request: SpeechRequest, _: str = Depends(verify_api_key)
             )
     
     logger.info(f"Speech request: voice={request.voice}, voice_path={voice_path}, text_len={len(request.input)}")
+    t_voice_resolve = time.perf_counter()
     
     # Prepare parameters
     generation_kwargs = {}
@@ -283,59 +302,68 @@ async def create_speech(request: SpeechRequest, _: str = Depends(verify_api_key)
         emo_params["use_random"] = emo_config.random
     
     # Create temp output file
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
-        output_path = tmp_file.name
-    
     try:
-        logger.info(f"Starting inference: output_path={output_path}")
-        
-        # Run inference
-        if model_version == "v2":
-            tts_model.infer(
-                spk_audio_prompt=voice_path,
-                text=request.input,
-                output_path=output_path,
-                interval_silence=interval_silence,
-                verbose=False,
-                **emo_params,
-                **generation_kwargs
-            )
-        else:
-            tts_model.infer(
-                audio_prompt=voice_path,
-                text=request.input,
-                output_path=output_path,
-                verbose=False,
-                **generation_kwargs
-            )
-        
+        logger.info("Starting inference (in-memory)")
+
+        async with app.state.infer_semaphore:
+            t_infer_start = time.perf_counter()
+
+            def _do_infer():
+                if model_version == "v2":
+                    return tts_model.infer(
+                        spk_audio_prompt=voice_path,
+                        text=request.input,
+                        output_path=None,
+                        interval_silence=interval_silence,
+                        verbose=False,
+                        log_timings=False,
+                        return_tensor=True,
+                        **emo_params,
+                        **generation_kwargs,
+                    )
+                return tts_model.infer(
+                    audio_prompt=voice_path,
+                    text=request.input,
+                    output_path=None,
+                    verbose=False,
+                    log_timings=False,
+                    return_tensor=True,
+                    **generation_kwargs,
+                )
+
+            infer_result = await run_in_threadpool(_do_infer)
+            t_infer_end = time.perf_counter()
+
+        if not infer_result or not isinstance(infer_result, (tuple, list)) or len(infer_result) != 2:
+            raise RuntimeError("Inference returned an invalid result")
+        sampling_rate, audio_tensor = infer_result
+        if audio_tensor is None:
+            raise RuntimeError("Inference returned empty audio")
         logger.info("Inference completed")
         
-        # Read generated audio
-        if not os.path.exists(output_path):
-            raise RuntimeError(f"Output file not created: {output_path}")
-        
-        with open(output_path, "rb") as f:
-            wav_data = f.read()
-        
-        if len(wav_data) == 0:
-            raise RuntimeError("Generated audio file is empty")
-        
         # Convert format if needed
-        if request.response_format != "wav":
-            try:
-                audio_data = convert_audio(wav_data, 22050, request.response_format)
-            except RuntimeError as e:
-                raise HTTPException(status_code=500, detail=str(e))
-        else:
-            audio_data = wav_data
+        t_convert_start = time.perf_counter()
+        try:
+            audio_data = convert_audio(audio_tensor, int(sampling_rate), request.response_format)
+        except RuntimeError as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        t_convert_end = time.perf_counter()
         
         logger.info(f"Returning audio: {len(audio_data)} bytes, format={request.response_format}")
+
+        headers = {"Content-Disposition": f'attachment; filename="speech.{request.response_format}"'}
+        if app.state.args.timing_headers:
+            headers.update({
+                "X-IndexTTS-Time-VoiceResolve-MS": f"{(t_voice_resolve - t0) * 1000:.2f}",
+                "X-IndexTTS-Time-Infer-MS": f"{(t_infer_end - t_infer_start) * 1000:.2f}",
+                "X-IndexTTS-Time-Convert-MS": f"{(t_convert_end - t_convert_start) * 1000:.2f}",
+                "X-IndexTTS-Time-Total-MS": f"{(t_convert_end - t0) * 1000:.2f}",
+            })
         
         return Response(
             content=audio_data,
             media_type=get_content_type(request.response_format),
-            headers={"Content-Disposition": f'attachment; filename="speech.{request.response_format}"'}
+            headers=headers,
         )
     
     except HTTPException:
@@ -346,13 +374,8 @@ async def create_speech(request: SpeechRequest, _: str = Depends(verify_api_key)
         raise HTTPException(status_code=500, detail=f"Speech synthesis failed: {str(e)}")
     
     finally:
-        # Cleanup temp files
-        if os.path.exists(output_path):
-            os.remove(output_path)
-        if request.x_voice_audio and voice_path and os.path.exists(voice_path):
-            os.remove(voice_path)
-        if emo_audio_path and os.path.exists(emo_audio_path):
-            os.remove(emo_audio_path)
+        # Cleanup per-request temp files (cached base64 voices are managed by VoiceManager)
+        pass
 
 
 # ============================================================================
