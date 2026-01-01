@@ -276,11 +276,17 @@ async def create_speech(request: SpeechRequest, _: str = Depends(verify_api_key)
     
     if request.x_advanced:
         generation_kwargs["max_text_tokens_per_segment"] = request.x_advanced.max_tokens_per_segment
+        generation_kwargs["max_mel_tokens"] = request.x_advanced.max_mel_tokens
+        generation_kwargs["do_sample"] = request.x_advanced.do_sample
         generation_kwargs["temperature"] = request.x_advanced.temperature
         generation_kwargs["top_p"] = request.x_advanced.top_p
         generation_kwargs["top_k"] = request.x_advanced.top_k
+        generation_kwargs["num_beams"] = request.x_advanced.num_beams
+        generation_kwargs["length_penalty"] = request.x_advanced.length_penalty
         generation_kwargs["repetition_penalty"] = request.x_advanced.repetition_penalty
         interval_silence = request.x_advanced.interval_silence
+        generation_kwargs["diffusion_steps"] = request.x_advanced.diffusion_steps
+        generation_kwargs["inference_cfg_rate"] = request.x_advanced.inference_cfg_rate
     
     # Emotion settings (v2 only)
     emo_params = {}

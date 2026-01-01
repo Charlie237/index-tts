@@ -626,7 +626,7 @@ class IndexTTS2:
                         cond_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
                         emo_cond_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
                         emo_vec=emovec,
-                        do_sample=True,
+                        do_sample=do_sample,
                         top_p=top_p,
                         top_k=top_k,
                         temperature=temperature,
@@ -689,6 +689,8 @@ class IndexTTS2:
                     )
                     gpt_forward_time += time.perf_counter() - m_start_time
 
+                diffusion_steps = int(generation_kwargs.pop("diffusion_steps", 25))
+                inference_cfg_rate = float(generation_kwargs.pop("inference_cfg_rate", 0.7))
                 latent_gpt = latent
                 m_start_time = time.perf_counter()
                 with torch.amp.autocast(
@@ -696,8 +698,6 @@ class IndexTTS2:
                     enabled=self.s2mel_amp_dtype is not None,
                     dtype=self.s2mel_amp_dtype,
                 ):
-                    diffusion_steps = 25
-                    inference_cfg_rate = 0.7
                     latent_s2mel = self.s2mel.models['gpt_layer'](latent_gpt)
                     S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
                     S_infer = S_infer.transpose(1, 2)
@@ -742,11 +742,10 @@ class IndexTTS2:
                     wav_all_finite = False
 
                 if (not wav_all_finite) or wav_abs_max < 1e-4:
-                    if verbose or log_timings:
-                        print(
-                            f">> WARN: silent/invalid vocoder output detected (absmax={wav_abs_max:.2e}, finite={wav_all_finite}); "
-                            "retrying in float32...",
-                        )
+                    # Always log fallback usage; it's rare and important for diagnosing AMP stability.
+                    print(
+                        f">> AMP-FALLBACK: silent/invalid vocoder output (absmax={wav_abs_max:.2e}, finite={wav_all_finite}); retry vocoder float32"
+                    )
                     # Retry vocoder in float32 first (cheap).
                     wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0)
                     wav = wav.squeeze(1)
@@ -760,10 +759,7 @@ class IndexTTS2:
                 if (not wav_all_finite) or wav_abs_max < 1e-4:
                     # Retry s2mel+vocoder in float32 (expensive, but avoids "no sound").
                     if self.s2mel_amp_dtype is not None:
-                        if verbose or log_timings:
-                            print(">> WARN: retrying s2mel+vocoder in float32...")
-                        diffusion_steps = 25
-                        inference_cfg_rate = 0.7
+                        print(">> AMP-FALLBACK: retry s2mel+vocoder float32")
                         latent_s2mel = self.s2mel.models['gpt_layer'](latent_gpt.float())
                         S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
                         S_infer = S_infer.transpose(1, 2)

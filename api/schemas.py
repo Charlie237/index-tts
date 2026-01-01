@@ -45,11 +45,17 @@ class AdvancedConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
     
     max_tokens_per_segment: int = Field(default=120, ge=50, le=500)
+    max_mel_tokens: int = Field(default=1500, ge=50, le=20000)
+    do_sample: bool = Field(default=True)
     temperature: float = Field(default=0.8, ge=0.1, le=2.0)
     top_p: float = Field(default=0.8, ge=0.0, le=1.0)
     top_k: int = Field(default=30, ge=1, le=100)
+    num_beams: int = Field(default=3, ge=1, le=10)
+    length_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
     repetition_penalty: float = Field(default=10.0, ge=1.0, le=20.0)
     interval_silence: int = Field(default=200, ge=0, le=2000)
+    diffusion_steps: int = Field(default=25, ge=1, le=50)
+    inference_cfg_rate: float = Field(default=0.7, ge=0.0, le=2.0)
 
 
 class SpeechRequest(BaseModel):
